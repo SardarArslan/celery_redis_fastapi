@@ -56,7 +56,7 @@ FASTAPI_CONFIG = {
 # Task-specific configurations
 TASK_CONFIG = {
     "cpu_task_timeout": 60,  # seconds
-    "io_task_timeout": 30,  # seconds
+    "io_task_timeout": 180,  # seconds
     "priority_task_timeout": 10,  # seconds (faster for priority)
     "max_retries": 3,
     "retry_delay": 5,

@@ -19,12 +19,14 @@ celery_app.conf.update(
     task_queues=[
         Queue('cpu_high'),
         Queue('cpu_normal'),
+        Queue('io-bound')
     ],
     # Task routing
     task_routes={
         'tasks.cpu_heavy_task1': {'queue': 'cpu_normal'},
         'tasks.cpu_heavy_task2': {'queue': 'cpu_normal'},
         'tasks.cpu_priority_task': {'queue': 'cpu_high'},
+        'tasks.download_pdf': {'queue': 'io-bound'}
     },
 
 )

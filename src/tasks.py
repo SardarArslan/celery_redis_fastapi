@@ -1,17 +1,49 @@
 import time
 import hashlib
+from http.client import responses
+
 import numpy as np
 import pandas as pd
 import aiofiles
+import aiohttp
+import requests
+from celery.bin.result import result
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 import asyncio
 import os
 from datetime import datetime
-
+import atexit
 from functools import lru_cache
 from .celery_app import celery, PriorityTask
 from .config import TASK_CONFIG
 
+class SessionManager:
+    def __init__(self):
+        self._session = None
+        atexit.register(self._close_session)
 
+    def _create_session(self):
+        session = requests.Session()
+        retry = Retry(total=3,backoff_factor=1,status_forcelist=[429,500,502,503])
+        adapter = HTTPAdapter(max_retries=retry,pool_maxsize=100,pool_connections=100,pool_block=False)
+        session.mount("http://",adapter)
+        session.mount("https://",adapter)
+        self._session = session
+        return self._session
+
+    def get_session(self):
+        if self._session is None:
+            self._session = self._create_session()
+        return self._session
+
+    def _close_session(self):
+        if self._session:
+            self._session.close()
+            self._session = None
+
+
+session_manager = SessionManager()
 # ==================== CPU-BOUND TASKS (Handled by Celery) ====================
 
 @celery.task(
@@ -245,54 +277,85 @@ def cpu_priority_task(self, urgent_data: dict) -> dict:
 
 
 # ==================== ASYNC I/O-BOUND TASKS (Handled by FastAPI) ====================
+@celery.task(
+    bind=True,
+    base=PriorityTask,
+    queue='io-bound',
+    max_retries=TASK_CONFIG['max_retries'],  # Fewer retries for priority tasks
+    default_retry_delay=2,
+    time_limit=TASK_CONFIG['io_task_timeout'],
+    soft_time_limit=TASK_CONFIG['io_task_timeout'] - 10,
+    priority=5,  # High priority (0-9, 9 is highest in Redis)
+    name='tasks.download_pdf'
+)
+def download_pdf(self, url: str) -> dict:
+    task_id = self.request.id
+    filepath=None
+    try:
 
-async def async_io_task1(urls: list, timeout: int = 10) -> dict:
-    """
-    Async I/O Task 1: Fetch multiple web pages concurrently
-    Uses aiohttp for non-blocking HTTP requests
-    """
+        filename = f"{task_id}.pdf"
+        download_dir = "./downloads"
+        os.makedirs(download_dir,exist_ok=True)
+        filepath = os.path.join(download_dir,filename)
+        # NOTE the stream=True parameter below
+        session = session_manager.get_session()
+        response = session.get(url,stream=True,timeout=(10,30))
+        response.raise_for_status()
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded =0
+        with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded+=len(chunk)
+        if total_size > 0 and downloaded != total_size:
+            raise ValueError(f"Incomplete download: {downloaded}/{total_size}")
+        actual_size = os.path.getsize(filepath)
+        result = {
+            "task_id":task_id,
+            "task_type":"download_pdf",
+            "success":True,
+            "filepath":filepath,
+            "size":actual_size,
+            "url":url,
+            "status":"completed"
+        }
+        print(f"[DOWNLOAD][{task_id[:8]}] Downloaded {actual_size} bytes to {filepath}")
+
+        return result
+
+    except Exception as exc:
+        status_code = exc.response.status_code if hasattr(exc, 'response') else None
+
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except:
+                pass
 
 
-    print(f"[Async IO 1] Started fetching {len(urls)} URLs")
-    start_time = datetime.now()
+        if status_code and 400 <= status_code < 500 and status_code != 429:
+            print(f"[DOWNLOAD][{task_id[:8]}] Client error {status_code}: {exc}")
+            return {
+                "task_id": task_id,
+                "success": False,
+                "error": f"HTTP {status_code}",
+                "status": "failed"
+            }
 
-    results = []
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        for url in urls:
-            task = asyncio.create_task(
-                _fetch_single_url(session, url, timeout)
-            )
-            tasks.append(task)
-
-        # Gather all results with error handling
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for url, result in zip(urls, gathered):
-            if isinstance(result, Exception):
-                results.append({
-                    'url': url,
-                    'success': False,
-                    'error': str(result),
-                    'status_code': None,
-                    'size': 0
-                })
-            else:
-                results.append(result)
-
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
-
-    return {
-        'task_type': 'async_io_fetch_urls',
-        'urls_processed': len(urls),
-        'successful': len([r for r in results if r['success']]),
-        'failed': len([r for r in results if not r['success']]),
-        'total_size': sum(r['size'] for r in results if r['success']),
-        'execution_time': duration,
-        'results': results[:5]  # Return first 5 for brevity
-    }
-
+        print(f"[DOWNLOAD][{task_id[:8]}] Error: {exc}")
+        raise self.retry(
+            exc=exc,
+            countdown=min(60, TASK_CONFIG['retry_delay'] * (2 ** self.request.retries))
+        )
+def _cleanup_file(filepath, task_id):
+    """Helper function to cleanup files"""
+    if filepath and os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+            print(f"[DOWNLOAD][{task_id[:8]}] Cleaned up partial file")
+        except Exception as cleanup_exc:
+            print(f"[DOWNLOAD][{task_id[:8]}] Cleanup failed: {cleanup_exc}")
 
 async def async_io_task2(file_paths: list, operation: str = 'read') -> dict:
     """
